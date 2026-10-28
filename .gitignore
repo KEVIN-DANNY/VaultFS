@@ -1,0 +1,15 @@
+# Compiled binaries and object files
+*.o
+vaultfs
+vaultfs-ctl
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+
+# Temporary test backing and mount stores
+/tmp/
+*.dat
+*.snap
+*.log
