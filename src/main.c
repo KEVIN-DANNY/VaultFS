@@ -4,6 +4,7 @@
 #include "inode.h"
 #include "snapshot.h"
 #include "fuse_ops.h"
+#include "wal.h"
 
 VaultFSContext g_vaultfs;
 
@@ -87,12 +88,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: Failed to load snapshots\n");
     }
 
+    // Initialize Write-Ahead Intent Logging & Crash Consistency Engine
+    if (wal_init(g_vaultfs.backing_dir) != 0) {
+        fprintf(stderr, "Warning: Failed to initialize WAL subsystem\n");
+    } else {
+        printf("[*] Write-Ahead Intent Log    : Durability & Pre-Image Pinning ACTIVE\n");
+        int recovered = wal_recover_and_replay();
+        if (recovered > 0) {
+            printf("[+] Replayed and recovered %d uncommitted transaction(s) after crash.\n", recovered);
+        }
+    }
+
     printf("[+] Subsystems initialized successfully. Starting FUSE loop...\n\n");
 
     // Run FUSE main event loop
     int ret = fuse_main(fuse_argc, fuse_argv, vaultfs_get_operations(), NULL);
 
-    // Clean exit: flush metadata
+    // Clean exit: flush metadata and close WAL
+    wal_close();
     storage_save_catalog();
     inode_save();
 

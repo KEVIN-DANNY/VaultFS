@@ -18,6 +18,7 @@ typedef struct {
     uint32_t ref_count;
     uint32_t disk_size;
     uint32_t original_size;
+    uint32_t pin_count;
 } CatalogEntry;
 
 typedef struct {
@@ -68,19 +69,45 @@ static void cmd_stats(const char *storage_dir) {
         return;
     }
 
+    struct stat st;
+    fstat(fileno(f), &st);
+    size_t data_size = st.st_size - sizeof(uint32_t);
+
     CatalogEntry *entries = calloc(count, sizeof(CatalogEntry));
     if (!entries) { fclose(f); return; }
-    fread(entries, sizeof(CatalogEntry), count, f);
+
+    if (data_size >= count * sizeof(CatalogEntry)) {
+        fread(entries, sizeof(CatalogEntry), count, f);
+    } else {
+        typedef struct {
+            char     hash[VAULTFS_HASH_HEX_LEN + 1];
+            uint32_t ref_count;
+            uint32_t disk_size;
+            uint32_t original_size;
+        } OldCatalogEntry;
+        for (uint32_t i = 0; i < count; i++) {
+            OldCatalogEntry old_ent;
+            if (fread(&old_ent, sizeof(OldCatalogEntry), 1, f) == 1) {
+                strcpy(entries[i].hash, old_ent.hash);
+                entries[i].ref_count = old_ent.ref_count;
+                entries[i].disk_size = old_ent.disk_size;
+                entries[i].original_size = old_ent.original_size;
+                entries[i].pin_count = 0;
+            }
+        }
+    }
     fclose(f);
 
     uint64_t total_logical = 0;
     uint64_t total_physical = 0;
     uint64_t total_refs = 0;
+    uint32_t total_pinned = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         total_physical += entries[i].disk_size;
         total_logical += (uint64_t)entries[i].original_size * entries[i].ref_count;
         total_refs += entries[i].ref_count;
+        if (entries[i].pin_count > 0) total_pinned++;
     }
 
     // Read inode metadata & RansomShield status
@@ -151,6 +178,7 @@ static void cmd_stats(const char *storage_dir) {
     printf("-----------------------------------------------------------------------\n");
     printf("  Ransomware Attacks Blocked : %u attack(s) neutralized\n", attacks_detected);
     printf("  Files Under Quarantine     : %u file(s) protected in Ghost Tomb\n", files_quarantined);
+    printf("  Pinned Pre-Image Blocks    : %u block(s) protected by WAL\n", total_pinned);
     printf("=======================================================================\n\n");
 
     free(entries);

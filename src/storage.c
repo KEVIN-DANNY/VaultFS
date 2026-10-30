@@ -8,6 +8,7 @@ typedef struct {
     uint32_t ref_count;
     uint32_t disk_size;
     uint32_t original_size;
+    uint32_t pin_count; // Number of active pre-image pins preventing GC
 } CatalogEntry;
 
 static CatalogEntry s_catalog[MAX_CATALOG_ENTRIES];
@@ -169,6 +170,51 @@ int storage_retain_chunk(const char *hash) {
     return -1;
 }
 
+int storage_pin_chunk(const char *hash) {
+    if (!hash || strlen(hash) == 0) return 0;
+    pthread_mutex_lock(&s_storage_lock);
+    int idx = find_catalog_entry(hash);
+    if (idx >= 0) {
+        s_catalog[idx].pin_count++;
+        pthread_mutex_unlock(&s_storage_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&s_storage_lock);
+    return -ENOENT;
+}
+
+int storage_unpin_chunk(const char *hash) {
+    if (!hash || strlen(hash) == 0) return 0;
+    pthread_mutex_lock(&s_storage_lock);
+    int idx = find_catalog_entry(hash);
+    if (idx >= 0 && s_catalog[idx].pin_count > 0) {
+        s_catalog[idx].pin_count--;
+        if (s_catalog[idx].pin_count == 0 && s_catalog[idx].ref_count == 0) {
+            // Block was released while pinned: now safe to unlink
+            char block_path[VAULTFS_MAX_PATH * 2];
+            get_block_path(hash, block_path, sizeof(block_path));
+            unlink(block_path);
+
+            s_catalog[idx] = s_catalog[s_catalog_count - 1];
+            s_catalog_count--;
+            storage_save_catalog();
+        }
+        pthread_mutex_unlock(&s_storage_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&s_storage_lock);
+    return -ENOENT;
+}
+
+bool storage_is_chunk_pinned(const char *hash) {
+    if (!hash || strlen(hash) == 0) return false;
+    pthread_mutex_lock(&s_storage_lock);
+    int idx = find_catalog_entry(hash);
+    bool pinned = (idx >= 0 && s_catalog[idx].pin_count > 0);
+    pthread_mutex_unlock(&s_storage_lock);
+    return pinned;
+}
+
 int storage_release_chunk(const char *hash) {
     pthread_mutex_lock(&s_storage_lock);
     int idx = find_catalog_entry(hash);
@@ -180,14 +226,20 @@ int storage_release_chunk(const char *hash) {
     if (s_catalog[idx].ref_count > 1) {
         s_catalog[idx].ref_count--;
     } else {
-        // Last reference: delete physical block file
-        char block_path[VAULTFS_MAX_PATH + 128];
-        get_block_path(hash, block_path, sizeof(block_path));
-        unlink(block_path);
+        s_catalog[idx].ref_count = 0;
+        if (s_catalog[idx].pin_count > 0) {
+            // PINNED: Must never delete a pinned pre-image block!
+            // It remains reserved on disk until explicitly unpinned.
+        } else {
+            // Last reference and not pinned: delete physical block file
+            char block_path[VAULTFS_MAX_PATH * 2];
+            get_block_path(hash, block_path, sizeof(block_path));
+            unlink(block_path);
 
-        // Remove from catalog
-        s_catalog[idx] = s_catalog[s_catalog_count - 1];
-        s_catalog_count--;
+            // Remove from catalog
+            s_catalog[idx] = s_catalog[s_catalog_count - 1];
+            s_catalog_count--;
+        }
     }
 
     storage_save_catalog();
@@ -232,30 +284,161 @@ void storage_get_stats(VaultFSStats *stats) {
 }
 
 void storage_save_catalog(void) {
-    char path[VAULTFS_MAX_PATH + 64];
+    char path[VAULTFS_MAX_PATH * 2];
+    char tmp_path[VAULTFS_MAX_PATH * 2];
     snprintf(path, sizeof(path), "%s/metadata/catalog.dat", g_vaultfs.backing_dir);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/metadata/catalog.dat.tmp", g_vaultfs.backing_dir);
 
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
 
-    fwrite(&s_catalog_count, sizeof(uint32_t), 1, f);
-    fwrite(s_catalog, sizeof(CatalogEntry), s_catalog_count, f);
-    fclose(f);
+    ssize_t w1 = write(fd, &s_catalog_count, sizeof(uint32_t));
+    ssize_t w2 = write(fd, s_catalog, sizeof(CatalogEntry) * s_catalog_count);
+    (void)w1; (void)w2;
+
+    fdatasync(fd);
+    close(fd);
+    rename(tmp_path, path);
 }
 
 void storage_load_catalog(void) {
-    char path[VAULTFS_MAX_PATH + 64];
+    char path[VAULTFS_MAX_PATH * 2];
     snprintf(path, sizeof(path), "%s/metadata/catalog.dat", g_vaultfs.backing_dir);
 
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
 
-    if (fread(&s_catalog_count, sizeof(uint32_t), 1, f) == 1) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(uint32_t)) {
+        close(fd);
+        return;
+    }
+
+    if (read(fd, &s_catalog_count, sizeof(uint32_t)) == sizeof(uint32_t)) {
         if (s_catalog_count > MAX_CATALOG_ENTRIES) {
             s_catalog_count = MAX_CATALOG_ENTRIES;
         }
-        size_t read_items = fread(s_catalog, sizeof(CatalogEntry), s_catalog_count, f);
-        (void)read_items;
+        size_t expected_bytes = s_catalog_count * sizeof(CatalogEntry);
+        size_t avail_bytes = st.st_size - sizeof(uint32_t);
+        if (avail_bytes >= expected_bytes) {
+            ssize_t rd = read(fd, s_catalog, expected_bytes);
+            (void)rd;
+        } else {
+            typedef struct {
+                char     hash[VAULTFS_HASH_HEX_LEN + 1];
+                uint32_t ref_count;
+                uint32_t disk_size;
+                uint32_t original_size;
+            } OldCatalogEntry;
+            lseek(fd, sizeof(uint32_t), SEEK_SET);
+            for (uint32_t i = 0; i < s_catalog_count; i++) {
+                OldCatalogEntry old_ent;
+                if (read(fd, &old_ent, sizeof(OldCatalogEntry)) == sizeof(OldCatalogEntry)) {
+                    strcpy(s_catalog[i].hash, old_ent.hash);
+                    s_catalog[i].ref_count = old_ent.ref_count;
+                    s_catalog[i].disk_size = old_ent.disk_size;
+                    s_catalog[i].original_size = old_ent.original_size;
+                    s_catalog[i].pin_count = 0;
+                } else {
+                    s_catalog_count = i;
+                    break;
+                }
+            }
+        }
     }
-    fclose(f);
+    close(fd);
+}
+
+int storage_rebuild_and_audit(void) {
+    pthread_mutex_lock(&s_storage_lock);
+    printf("[AUDIT] Starting Storage Refcount Audit and Consistency Check...\n");
+
+    uint32_t *actual_refs = calloc(s_catalog_count, sizeof(uint32_t));
+    if (!actual_refs && s_catalog_count > 0) {
+        pthread_mutex_unlock(&s_storage_lock);
+        return -ENOMEM;
+    }
+
+    // 1. Account for references from active inodes
+    for (uint32_t i = 0; i < g_vaultfs.inode_count; i++) {
+        VaultInode *node = &g_vaultfs.inodes[i];
+        for (uint32_t c = 0; c < node->chunk_count; c++) {
+            int idx = find_catalog_entry(node->chunk_hashes[c]);
+            if (idx >= 0) {
+                actual_refs[idx]++;
+            }
+        }
+        if (node->is_quarantined || node->ghost_chunk_count > 0) {
+            for (uint32_t c = 0; c < node->ghost_chunk_count; c++) {
+                int idx = find_catalog_entry(node->ghost_chunk_hashes[c]);
+                if (idx >= 0) {
+                    actual_refs[idx]++;
+                }
+            }
+        }
+    }
+
+    // 2. Account for references from snapshots
+    for (uint32_t s = 0; s < g_vaultfs.snapshot_count; s++) {
+        VaultSnapshot *snap = &g_vaultfs.snapshots[s];
+        for (uint32_t i = 0; i < snap->inode_count; i++) {
+            VaultInode *node = &snap->inodes[i];
+            for (uint32_t c = 0; c < node->chunk_count; c++) {
+                int idx = find_catalog_entry(node->chunk_hashes[c]);
+                if (idx >= 0) {
+                    actual_refs[idx]++;
+                }
+            }
+        }
+    }
+
+    // 3. Reconcile with s_catalog
+    int discrepancies = 0;
+    int orphans_cleaned = 0;
+
+    int k = 0;
+    while (k < (int)s_catalog_count) {
+        uint32_t expected = actual_refs[k];
+        if (s_catalog[k].ref_count != expected) {
+            printf("[AUDIT WARNING] Refcount discrepancy on block %.16s...: catalog=%u, actual=%u. Correcting!\n",
+                   s_catalog[k].hash, s_catalog[k].ref_count, expected);
+            s_catalog[k].ref_count = expected;
+            discrepancies++;
+        }
+
+        if (s_catalog[k].ref_count == 0 && s_catalog[k].pin_count == 0) {
+            char block_path[VAULTFS_MAX_PATH * 2];
+            get_block_path(s_catalog[k].hash, block_path, sizeof(block_path));
+            unlink(block_path);
+
+            s_catalog[k] = s_catalog[s_catalog_count - 1];
+            actual_refs[k] = actual_refs[s_catalog_count - 1];
+            s_catalog_count--;
+            orphans_cleaned++;
+            // Re-evaluate the swapped element without advancing k
+        } else {
+            k++;
+        }
+    }
+
+    free(actual_refs);
+
+    // 4. Verify physical files on disk
+    int missing_blocks = 0;
+    for (uint32_t k = 0; k < s_catalog_count; k++) {
+        char block_path[VAULTFS_MAX_PATH * 2];
+        get_block_path(s_catalog[k].hash, block_path, sizeof(block_path));
+        struct stat st;
+        if (stat(block_path, &st) != 0) {
+            fprintf(stderr, "[AUDIT ERROR] Missing physical block file for hash %.16s...!\n", s_catalog[k].hash);
+            missing_blocks++;
+        }
+    }
+
+    storage_save_catalog();
+    pthread_mutex_unlock(&s_storage_lock);
+
+    printf("[AUDIT COMPLETE] Discrepancies fixed: %d, Orphans cleaned: %d, Missing blocks: %d. Total valid blocks: %u\n",
+           discrepancies, orphans_cleaned, missing_blocks, s_catalog_count);
+    return discrepancies;
 }

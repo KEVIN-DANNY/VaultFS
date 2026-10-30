@@ -1,6 +1,7 @@
 #include "inode.h"
 #include "storage.h"
 #include "entropy.h"
+#include "wal.h"
 
 static void split_path(const char *path, char *parent_path, char *basename) {
     char temp[VAULTFS_MAX_PATH];
@@ -202,10 +203,13 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
         old_hash[0] = '\0';
 
         // If partial chunk write, read existing chunk data first
-        if (chunk_idx < node->chunk_count && (chunk_offset > 0 || write_len < VAULTFS_BLOCK_SIZE)) {
-            size_t actual_len = 0;
+        if (chunk_idx < node->chunk_count) {
             strcpy(old_hash, node->chunk_hashes[chunk_idx]);
-            storage_read_chunk(old_hash, chunk_buf, &actual_len);
+            if (chunk_offset > 0 || write_len < VAULTFS_BLOCK_SIZE) {
+                fault_inject_point("during_partial_write");
+                size_t actual_len = 0;
+                storage_read_chunk(old_hash, chunk_buf, &actual_len);
+            }
         }
 
         // Apply new data into chunk buffer
@@ -226,11 +230,17 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
             return -EIO;
         }
 
+        // Feature 3: Write-Ahead Intent Logging & Crash-Consistent Pre-image Pinning
+        uint64_t txid = wal_begin_tx();
+        uint64_t projected_size = (offset + size > node->size) ? (offset + size) : node->size;
+        if (strlen(old_hash) > 0) {
+            wal_log_pre_overwrite(txid, node->ino, (uint32_t)chunk_idx, old_hash, new_hash, node->size, projected_size);
+        }
+
+        fault_inject_point("before_inode_update");
+
         // Update node chunk hash table
         if (chunk_idx < node->chunk_count) {
-            if (strlen(old_hash) > 0 && strcmp(old_hash, new_hash) != 0) {
-                storage_release_chunk(old_hash);
-            }
             strcpy(node->chunk_hashes[chunk_idx], new_hash);
         } else {
             while (node->chunk_count < chunk_idx) {
@@ -240,6 +250,21 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
                 strcpy(node->chunk_hashes[node->chunk_count++], zero_hash);
             }
             strcpy(node->chunk_hashes[node->chunk_count++], new_hash);
+        }
+
+        fault_inject_point("after_inode_update");
+
+        // Commit WAL transaction
+        wal_commit_tx(txid);
+
+        // Safely unpin and release old chunk
+        if (strlen(old_hash) > 0) {
+            storage_unpin_chunk(old_hash);
+            fault_inject_point("before_release_chunk");
+            if (strcmp(old_hash, new_hash) != 0) {
+                storage_release_chunk(old_hash);
+            }
+            fault_inject_point("after_release_chunk");
         }
 
         bytes_written += write_len;
@@ -320,11 +345,26 @@ int inode_truncate(VaultInode *node, off_t new_size) {
     size_t new_chunk_count = (new_size + VAULTFS_BLOCK_SIZE - 1) / VAULTFS_BLOCK_SIZE;
 
     if (new_chunk_count < node->chunk_count) {
+        uint64_t txid = wal_begin_tx();
+
+        // Step 1: Pin and log all chunks about to be truncated
         for (size_t i = new_chunk_count; i < node->chunk_count; i++) {
-            storage_release_chunk(node->chunk_hashes[i]);
+            wal_log_pre_truncate(txid, node->ino, (uint32_t)i, node->chunk_hashes[i], node->size, new_size);
+        }
+
+        fault_inject_point("during_truncate");
+
+        // Step 2: Clear chunk hashes and release blocks
+        for (size_t i = new_chunk_count; i < node->chunk_count; i++) {
+            char old_h[VAULTFS_HASH_HEX_LEN + 1];
+            strcpy(old_h, node->chunk_hashes[i]);
             node->chunk_hashes[i][0] = '\0';
+            storage_unpin_chunk(old_h);
+            storage_release_chunk(old_h);
         }
         node->chunk_count = (uint32_t)new_chunk_count;
+
+        wal_commit_tx(txid);
     }
 
     node->size = (uint64_t)new_size;
@@ -421,18 +461,24 @@ int inode_heal_quarantine(void) {
 }
 
 void inode_save(void) {
-    char path[VAULTFS_MAX_PATH + 64];
+    char path[VAULTFS_MAX_PATH * 2];
+    char tmp_path[VAULTFS_MAX_PATH * 2];
     snprintf(path, sizeof(path), "%s/metadata/inodes.dat", g_vaultfs.backing_dir);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/metadata/inodes.dat.tmp", g_vaultfs.backing_dir);
 
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
 
-    fwrite(&g_vaultfs.inode_count, sizeof(uint32_t), 1, f);
-    fwrite(&g_vaultfs.next_ino, sizeof(uint64_t), 1, f);
-    fwrite(&g_vaultfs.ransomware_attacks_detected, sizeof(uint32_t), 1, f);
-    fwrite(&g_vaultfs.files_quarantined, sizeof(uint32_t), 1, f);
-    fwrite(g_vaultfs.inodes, sizeof(VaultInode), g_vaultfs.inode_count, f);
-    fclose(f);
+    ssize_t w1 = write(fd, &g_vaultfs.inode_count, sizeof(uint32_t));
+    ssize_t w2 = write(fd, &g_vaultfs.next_ino, sizeof(uint64_t));
+    ssize_t w3 = write(fd, &g_vaultfs.ransomware_attacks_detected, sizeof(uint32_t));
+    ssize_t w4 = write(fd, &g_vaultfs.files_quarantined, sizeof(uint32_t));
+    ssize_t w5 = write(fd, g_vaultfs.inodes, sizeof(VaultInode) * g_vaultfs.inode_count);
+    (void)w1; (void)w2; (void)w3; (void)w4; (void)w5;
+
+    fdatasync(fd);
+    close(fd);
+    rename(tmp_path, path);
 }
 
 void inode_load(void) {

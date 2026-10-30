@@ -15,6 +15,11 @@ RUN apt-get update && apt-get install -y \
     procps \
     tree \
     util-linux \
+    sqlite3 \
+    libsqlite3-dev \
+    zip \
+    unzip \
+    bc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/VaultFS
