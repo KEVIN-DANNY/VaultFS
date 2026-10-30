@@ -41,13 +41,24 @@ typedef struct {
     uint64_t ghost_size;
     uint32_t ghost_chunk_count;
     char     ghost_chunk_hashes[16384][VAULTFS_HASH_HEX_LEN + 1];
+    pid_t    quarantined_by_tree;
 } VaultInode;
+
+typedef struct {
+    pid_t    tree_root;
+    double   anomaly_score;
+    time_t   flagged_at;
+    uint32_t file_count;
+    char     file_names[32][VAULTFS_MAX_NAME];
+    uint64_t inode_ids[32];
+} SuspectDiskRecord;
 
 static void print_help(const char *prog) {
     printf("VaultFS Control & Inspection Tool (vaultfs-ctl)\n\n");
     printf("Usage:\n");
     printf("  %s stats <storage_dir>                  Display real-time deduplication & RansomShield metrics\n", prog);
-    printf("  %s heal <storage_dir>                   Restore all ransomware-quarantined files to baseline\n", prog);
+    printf("  %s heal [--tree <root_pid>] <dir>       Restore quarantined files (scoped to process-tree)\n", prog);
+    printf("  %s suspects <storage_dir>               List flagged process trees and affected files\n", prog);
     printf("  %s quarantine <storage_dir>             List files flagged & quarantined by RansomShield\n", prog);
     printf("  %s inspect-blocks <storage_dir>         Inspect raw encrypted disk blocks\n", prog);
     printf("  %s snapshots <storage_dir>              List all active snapshots\n", prog);
@@ -212,31 +223,125 @@ static void cmd_quarantine_list(const char *storage_dir) {
     fread(nodes, sizeof(VaultInode), inode_count, fi);
     fclose(fi);
 
-    printf("\n+-------------------------------------------------------------------------+\n");
-    printf("|              RANSOMSHIELD: QUARANTINED FILES (GHOST TOMB)               |\n");
-    printf("+----------------------+----------------+----------------+----------------+\n");
-    printf("| File Name            | Baseline Ent.  | Attack Status  | Ghost Blocks   |\n");
-    printf("+----------------------+----------------+----------------+----------------+\n");
+    printf("\n+-----------------------------------------------------------------------------------------+\n");
+    printf("|                      RANSOMSHIELD: QUARANTINED FILES (GHOST TOMB)                       |\n");
+    printf("+----------------------+----------------+----------------+----------------+---------------+\n");
+    printf("| File Name            | Baseline Ent.  | Attack Status  | Ghost Blocks   | Tree Root PID |\n");
+    printf("+----------------------+----------------+----------------+----------------+---------------+\n");
 
     uint32_t count = 0;
     for (uint32_t i = 0; i < inode_count; i++) {
         if (nodes[i].is_quarantined) {
-            printf("| %-20s | %-14.2f | QUARANTINED    | %-14u |\n",
-                   nodes[i].name, nodes[i].baseline_entropy, nodes[i].ghost_chunk_count);
+            printf("| %-20s | %-14.2f | QUARANTINED    | %-14u | %-13d |\n",
+                   nodes[i].name, nodes[i].baseline_entropy, nodes[i].ghost_chunk_count, (int)nodes[i].quarantined_by_tree);
             count++;
         }
     }
-    printf("+----------------------+----------------+----------------+----------------+\n");
+    printf("+----------------------+----------------+----------------+----------------+---------------+\n");
 
     if (count == 0) {
         printf("No files are currently quarantined. All files healthy.\n\n");
     } else {
-        printf("Run 'vaultfs-ctl heal %s' to restore quarantined files.\n\n", storage_dir);
+        printf("Run 'vaultfs-ctl heal %s' or 'vaultfs-ctl heal --tree <pid> %s' to restore.\n\n", storage_dir, storage_dir);
     }
     free(nodes);
 }
 
-static void cmd_heal(const char *storage_dir) {
+static void cmd_suspects(const char *storage_dir) {
+    char sus_path[VAULTFS_MAX_PATH];
+    snprintf(sus_path, sizeof(sus_path), "%s/metadata/suspects.dat", storage_dir);
+
+    FILE *fs = fopen(sus_path, "rb");
+    uint32_t count = 0;
+    SuspectDiskRecord records[256];
+    bool has_suspect_records = false;
+
+    if (fs) {
+        if (fread(&count, sizeof(uint32_t), 1, fs) == 1 && count <= 256) {
+            size_t rd = fread(records, sizeof(SuspectDiskRecord), count, fs);
+            if (rd == count && count > 0) {
+                has_suspect_records = true;
+            }
+        }
+        fclose(fs);
+    }
+
+    char ino_path[VAULTFS_MAX_PATH];
+    snprintf(ino_path, sizeof(ino_path), "%s/metadata/inodes.dat", storage_dir);
+    FILE *fi = fopen(ino_path, "rb");
+    uint32_t inode_count = 0;
+    VaultInode *nodes = NULL;
+    if (fi) {
+        uint64_t next_ino = 0;
+        uint32_t a_det = 0, q_files = 0;
+        if (fread(&inode_count, sizeof(uint32_t), 1, fi) == 1 &&
+            fread(&next_ino, sizeof(uint64_t), 1, fi) == 1 &&
+            fread(&a_det, sizeof(uint32_t), 1, fi) == 1 &&
+            fread(&q_files, sizeof(uint32_t), 1, fi) == 1) {
+            nodes = calloc(inode_count, sizeof(VaultInode));
+            if (nodes) {
+                fread(nodes, sizeof(VaultInode), inode_count, fi);
+            }
+        }
+        fclose(fi);
+    }
+
+    printf("\n=======================================================================\n");
+    printf("         VAULTFS: FLAGGED SUSPECT PROCESS TREES & ATTACK LOG           \n");
+    printf("=======================================================================\n");
+
+    if (!has_suspect_records) {
+        bool any_q = false;
+        if (nodes) {
+            for (uint32_t i = 0; i < inode_count; i++) {
+                if (nodes[i].is_quarantined) {
+                    any_q = true;
+                    break;
+                }
+            }
+        }
+        if (!any_q) {
+            printf("No suspect process trees flagged. All processes and files healthy.\n");
+            printf("=======================================================================\n\n");
+            if (nodes) free(nodes);
+            return;
+        }
+    }
+
+    if (has_suspect_records) {
+        for (uint32_t i = 0; i < count; i++) {
+            char time_buf[64] = "Unknown";
+            if (records[i].flagged_at > 0) {
+                struct tm *tm_info = localtime(&records[i].flagged_at);
+                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+            }
+            printf("[!] SUSPECT PROCESS TREE ROOT PID: %d\n", (int)records[i].tree_root);
+            printf("    Anomaly Score  : %.2f\n", records[i].anomaly_score);
+            printf("    Detection Time : %s\n", time_buf);
+            printf("    Affected Files (%u total):\n", records[i].file_count);
+            for (uint32_t j = 0; j < records[i].file_count; j++) {
+                printf("      * %s (ino: %lu)\n", records[i].file_names[j], records[i].inode_ids[j]);
+            }
+            printf("    Scoped Rollback: vaultfs-ctl heal --tree %d %s\n", (int)records[i].tree_root, storage_dir);
+            printf("-----------------------------------------------------------------------\n");
+        }
+    } else if (nodes) {
+        for (uint32_t i = 0; i < inode_count; i++) {
+            if (nodes[i].is_quarantined) {
+                printf("[!] SUSPECT PROCESS TREE ROOT PID: %d\n", (int)nodes[i].quarantined_by_tree);
+                printf("    Affected File: %s (ino: %lu, ghost blocks: %u)\n",
+                       nodes[i].name, nodes[i].ino, nodes[i].ghost_chunk_count);
+                printf("    Scoped Rollback: vaultfs-ctl heal --tree %d %s\n", (int)nodes[i].quarantined_by_tree, storage_dir);
+                printf("-----------------------------------------------------------------------\n");
+            }
+        }
+    }
+
+    printf("=======================================================================\n\n");
+    if (nodes) free(nodes);
+}
+
+static void cmd_heal_tree(pid_t target_tree, const char *storage_dir) {
     char ino_path[VAULTFS_MAX_PATH];
     snprintf(ino_path, sizeof(ino_path), "%s/metadata/inodes.dat", storage_dir);
 
@@ -265,16 +370,28 @@ static void cmd_heal(const char *storage_dir) {
     fclose(fi);
 
     uint32_t healed = 0;
+    uint32_t remaining_quarantined = 0;
+
     for (uint32_t i = 0; i < inode_count; i++) {
         if (nodes[i].is_quarantined && nodes[i].ghost_chunk_count > 0) {
-            printf("[+] Restoring '%s' from Ghost Quarantine Tomb (Original Size: %lu bytes, Blocks: %u)...\n",
-                   nodes[i].name, nodes[i].ghost_size, nodes[i].ghost_chunk_count);
+            if (target_tree != 0 && nodes[i].quarantined_by_tree != target_tree) {
+                // Not part of this tree's attack - leave untouched in quarantine
+                remaining_quarantined++;
+                continue;
+            }
+
+            printf("[+] Restoring '%s' from Ghost Quarantine Tomb (compromised by tree PID %d)...\n",
+                   nodes[i].name, (int)nodes[i].quarantined_by_tree);
+            printf("    Restored Size: %lu bytes | Original Blocks: %u\n",
+                   nodes[i].ghost_size, nodes[i].ghost_chunk_count);
+
             nodes[i].chunk_count = nodes[i].ghost_chunk_count;
             nodes[i].size = nodes[i].ghost_size;
             for (uint32_t c = 0; c < nodes[i].ghost_chunk_count; c++) {
                 strcpy(nodes[i].chunk_hashes[c], nodes[i].ghost_chunk_hashes[c]);
             }
             nodes[i].is_quarantined = false;
+            nodes[i].quarantined_by_tree = 0;
             nodes[i].ghost_chunk_count = 0;
             nodes[i].ghost_size = 0;
             nodes[i].mtime = time(NULL);
@@ -283,19 +400,34 @@ static void cmd_heal(const char *storage_dir) {
     }
 
     if (healed > 0) {
-        FILE *fo = fopen(ino_path, "wb");
+        char tmp_path[VAULTFS_MAX_PATH + 64];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", ino_path);
+        FILE *fo = fopen(tmp_path, "wb");
         if (fo) {
-            uint32_t zero_quarantined = 0;
             fwrite(&inode_count, sizeof(uint32_t), 1, fo);
             fwrite(&next_ino, sizeof(uint64_t), 1, fo);
             fwrite(&attacks_detected, sizeof(uint32_t), 1, fo);
-            fwrite(&zero_quarantined, sizeof(uint32_t), 1, fo);
+            fwrite(&remaining_quarantined, sizeof(uint32_t), 1, fo);
             fwrite(nodes, sizeof(VaultInode), inode_count, fo);
+            fflush(fo);
+            fdatasync(fileno(fo));
             fclose(fo);
-            printf("\n[SUCCESS] RansomShield restored %u quarantined file(s) to pristine condition with ZERO data loss!\n\n", healed);
+            rename(tmp_path, ino_path);
+
+            if (target_tree != 0) {
+                printf("\n[SUCCESS] Scoped rollback completed: restored %u file(s) compromised by tree %d.\n",
+                       healed, (int)target_tree);
+                printf("[+] Benign process modifications to other files remain completely intact!\n\n");
+            } else {
+                printf("\n[SUCCESS] Global rollback completed: restored %u quarantined file(s) to pristine baseline.\n\n", healed);
+            }
         }
     } else {
-        printf("No quarantined files found to heal.\n");
+        if (target_tree != 0) {
+            printf("No quarantined files found matching process tree root PID %d.\n", (int)target_tree);
+        } else {
+            printf("No quarantined files found to heal.\n");
+        }
     }
     free(nodes);
 }
@@ -427,18 +559,38 @@ int main(int argc, char **argv) {
     }
 
     const char *action = argv[1];
-    const char *storage_dir = argv[2];
 
     if (strcmp(action, "stats") == 0) {
-        cmd_stats(storage_dir);
+        cmd_stats(argv[2]);
     } else if (strcmp(action, "quarantine") == 0) {
-        cmd_quarantine_list(storage_dir);
+        cmd_quarantine_list(argv[2]);
+    } else if (strcmp(action, "suspects") == 0) {
+        cmd_suspects(argv[2]);
     } else if (strcmp(action, "heal") == 0) {
-        cmd_heal(storage_dir);
+        pid_t target_tree = 0;
+        const char *storage_dir = NULL;
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--tree") == 0) {
+                if (i + 1 < argc) {
+                    target_tree = (pid_t)atoi(argv[++i]);
+                }
+            } else if (!storage_dir) {
+                storage_dir = argv[i];
+            }
+        }
+
+        if (!storage_dir) {
+            fprintf(stderr, "Error: Storage directory required.\n");
+            print_help(argv[0]);
+            return 1;
+        }
+
+        cmd_heal_tree(target_tree, storage_dir);
     } else if (strcmp(action, "inspect-blocks") == 0) {
-        cmd_inspect_blocks(storage_dir);
+        cmd_inspect_blocks(argv[2]);
     } else if (strcmp(action, "snapshots") == 0) {
-        cmd_snapshots(storage_dir);
+        cmd_snapshots(argv[2]);
     } else {
         printf("Unknown action: %s\n", action);
         print_help(argv[0]);

@@ -2,6 +2,8 @@
 #include "inode.h"
 #include "snapshot.h"
 #include "storage.h"
+#include "proc_tree.h"
+#include "write_log.h"
 
 static int vaultfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
     (void)fi;
@@ -135,33 +137,57 @@ static int vaultfs_read(const char *path, char *buf, size_t size, off_t offset,
 static int vaultfs_write(const char *path, const char *buf, size_t size, off_t offset,
                          struct fuse_file_info *fi) {
     (void)fi;
+    struct fuse_context *ctx = fuse_get_context();
+    pid_t pid = ctx ? ctx->pid : getpid();
+    pid_t tree_root = proc_tree_get_root(pid);
+
     pthread_mutex_lock(&g_vaultfs.lock);
     VaultInode *node = inode_lookup(path);
     if (!node) {
         pthread_mutex_unlock(&g_vaultfs.lock);
         return -ENOENT;
     }
-    int res = inode_write(node, buf, size, offset);
+    int res = inode_write(node, buf, size, offset, pid, tree_root);
     pthread_mutex_unlock(&g_vaultfs.lock);
     return res;
 }
 
 static int vaultfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     (void)fi;
+    struct fuse_context *ctx = fuse_get_context();
+    pid_t pid = ctx ? ctx->pid : getpid();
+    pid_t tree_root = proc_tree_get_root(pid);
+
     pthread_mutex_lock(&g_vaultfs.lock);
     VaultInode *node = inode_lookup(path);
     if (!node) {
         pthread_mutex_unlock(&g_vaultfs.lock);
         return -ENOENT;
     }
-    int res = inode_truncate(node, size);
+    int res = inode_truncate(node, size, pid, tree_root);
     pthread_mutex_unlock(&g_vaultfs.lock);
     return res;
 }
 
 static int vaultfs_unlink(const char *path) {
+    struct fuse_context *ctx = fuse_get_context();
+    pid_t pid = ctx ? ctx->pid : getpid();
+    pid_t tree_root = proc_tree_get_root(pid);
+
     pthread_mutex_lock(&g_vaultfs.lock);
-    int res = inode_unlink(path);
+    int res = inode_unlink(path, pid, tree_root);
+    pthread_mutex_unlock(&g_vaultfs.lock);
+    return res;
+}
+
+static int vaultfs_rename(const char *oldpath, const char *newpath, unsigned int flags) {
+    (void)flags;
+    struct fuse_context *ctx = fuse_get_context();
+    pid_t pid = ctx ? ctx->pid : getpid();
+    pid_t tree_root = proc_tree_get_root(pid);
+
+    pthread_mutex_lock(&g_vaultfs.lock);
+    int res = inode_rename(oldpath, newpath, pid, tree_root);
     pthread_mutex_unlock(&g_vaultfs.lock);
     return res;
 }
@@ -224,6 +250,7 @@ static struct fuse_operations s_vaultfs_ops = {
     .write    = vaultfs_write,
     .truncate = vaultfs_truncate,
     .unlink   = vaultfs_unlink,
+    .rename   = vaultfs_rename,
     .mkdir    = vaultfs_mkdir,
     .rmdir    = vaultfs_rmdir,
     .statfs   = vaultfs_statfs,

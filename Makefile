@@ -3,7 +3,7 @@ CFLAGS ?= -Wall -Wextra -std=c11 -D_GNU_SOURCE
 FUSE_CFLAGS = $(shell pkg-config --cflags fuse3 2>/dev/null || echo "-I/usr/include/fuse3")
 FUSE_LIBS   = $(shell pkg-config --libs fuse3 2>/dev/null || echo "-lfuse3") -lssl -lcrypto -lpthread -lm
 
-SRCS = src/main.c src/crypto.c src/storage.c src/inode.c src/snapshot.c src/fuse_ops.c src/entropy.c src/wal.c
+SRCS = src/main.c src/crypto.c src/storage.c src/inode.c src/snapshot.c src/fuse_ops.c src/entropy.c src/wal.c src/proc_tree.c src/write_log.c
 OBJS = $(SRCS:.c=.o)
 
 TARGET = vaultfs

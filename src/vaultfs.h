@@ -58,6 +58,7 @@ typedef struct {
     uint64_t ghost_size;
     uint32_t ghost_chunk_count;
     char     ghost_chunk_hashes[VAULTFS_MAX_CHUNKS][VAULTFS_HASH_HEX_LEN + 1];
+    pid_t    quarantined_by_tree;   // Process-tree root PID that triggered quarantine (Feature 1)
 } VaultInode;
 
 // Snapshot Structure

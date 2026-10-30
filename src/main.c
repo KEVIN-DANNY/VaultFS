@@ -5,6 +5,8 @@
 #include "snapshot.h"
 #include "fuse_ops.h"
 #include "wal.h"
+#include "proc_tree.h"
+#include "write_log.h"
 
 VaultFSContext g_vaultfs;
 
@@ -98,6 +100,10 @@ int main(int argc, char **argv) {
             printf("[+] Replayed and recovered %d uncommitted transaction(s) after crash.\n", recovered);
         }
     }
+
+    proc_tree_init();
+    write_log_init(g_vaultfs.backing_dir);
+    printf("[*] Process-Attribution Log  : Bounded Ring Buffer & Anomaly Tracker ACTIVE\n");
 
     printf("[+] Subsystems initialized successfully. Starting FUSE loop...\n\n");
 

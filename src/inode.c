@@ -2,6 +2,8 @@
 #include "storage.h"
 #include "entropy.h"
 #include "wal.h"
+#include "proc_tree.h"
+#include "write_log.h"
 
 static void split_path(const char *path, char *parent_path, char *basename) {
     char temp[VAULTFS_MAX_PATH];
@@ -140,17 +142,24 @@ int inode_create(const char *path, mode_t mode, VaultInode **out_node) {
     return 0;
 }
 
-int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
+int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset, pid_t pid, pid_t tree_root) {
     if (!node || S_ISDIR(node->mode)) return -EISDIR;
     if (size == 0) return 0;
 
-    // --- RansomShield Anomaly Detection Pipeline ---
-    if (g_vaultfs.ransomshield_enabled && node->baseline_entropy > 0.0) {
-        double incoming_entropy = entropy_calculate((const unsigned char *)buf, size);
+    double incoming_entropy = entropy_calculate((const unsigned char *)buf, size);
+    double anomaly_delta = 0.0;
+    if (node->baseline_entropy > 0.0 && entropy_is_ransomware_suspect(node->baseline_entropy, incoming_entropy)) {
+        anomaly_delta = 1.0;
+    }
 
-        if (entropy_is_ransomware_suspect(node->baseline_entropy, incoming_entropy)) {
+    bool tree_flagged = write_log_evaluate_tree(tree_root, node->ino, anomaly_delta, ANOMALY_DEFAULT_THRESHOLD);
+
+    // --- RansomShield Anomaly Detection Pipeline (Process-Tree Attributed) ---
+    if (g_vaultfs.ransomshield_enabled && node->baseline_entropy > 0.0) {
+        if (anomaly_delta > 0.0 && tree_flagged) {
             if (!node->is_quarantined) {
                 node->is_quarantined = true;
+                node->quarantined_by_tree = tree_root;
                 if (node->ghost_chunk_count == 0 && node->chunk_count > 0) {
                     node->ghost_size = node->size;
                     node->ghost_chunk_count = node->chunk_count;
@@ -162,13 +171,15 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
 
                 g_vaultfs.ransomware_attacks_detected++;
                 g_vaultfs.files_quarantined++;
+                write_log_record_quarantined_file(tree_root, node->ino, node->name, incoming_entropy);
 
                 fprintf(stderr, "\n[!] ==================================================================\n");
                 fprintf(stderr, "[!] [RANSOMSHIELD ALERT] Ransomware attack intercepted on file '%s'!\n", node->name);
+                fprintf(stderr, "[!] Compromised Process Tree Root PID: %d (Caller PID: %d)\n", (int)tree_root, (int)pid);
                 fprintf(stderr, "[!] Baseline Entropy: %.2f | Incoming Entropy: %.2f (Elevated)\n",
                         node->baseline_entropy, incoming_entropy);
                 fprintf(stderr, "[!] Original %u block(s) frozen in Cryptographic Quarantine Tomb.\n", node->ghost_chunk_count);
-                fprintf(stderr, "[!] Self-healing available via: vaultfs-ctl heal <storage_dir>\n");
+                fprintf(stderr, "[!] Scoped rollback available via: vaultfs-ctl heal --tree %d <storage_dir>\n", (int)tree_root);
                 fprintf(stderr, "[!] ==================================================================\n\n");
             }
         } else if (node->ghost_chunk_count > 0 && !node->is_quarantined && incoming_entropy < 6.8) {
@@ -286,6 +297,9 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset) {
         }
     }
 
+    // Log write to bounded ring buffer with process-tree attribution
+    write_log_append(node->ino, offset, size, pid, tree_root, incoming_entropy, 0.0);
+
     inode_save();
     return (int)bytes_written;
 }
@@ -328,7 +342,7 @@ int inode_read(VaultInode *node, char *buf, size_t size, off_t offset) {
     return (int)bytes_read;
 }
 
-int inode_truncate(VaultInode *node, off_t new_size) {
+int inode_truncate(VaultInode *node, off_t new_size, pid_t pid, pid_t tree_root) {
     if (!node || S_ISDIR(node->mode)) return -EISDIR;
 
     // RansomShield Protection against O_TRUNC encryption wipes:
@@ -340,6 +354,11 @@ int inode_truncate(VaultInode *node, off_t new_size) {
             strcpy(node->ghost_chunk_hashes[c], node->chunk_hashes[c]);
             storage_retain_chunk(node->ghost_chunk_hashes[c]);
         }
+        node->quarantined_by_tree = tree_root;
+    }
+
+    if (write_log_is_tree_flagged(tree_root)) {
+        node->quarantined_by_tree = tree_root;
     }
 
     size_t new_chunk_count = (new_size + VAULTFS_BLOCK_SIZE - 1) / VAULTFS_BLOCK_SIZE;
@@ -369,11 +388,12 @@ int inode_truncate(VaultInode *node, off_t new_size) {
 
     node->size = (uint64_t)new_size;
     node->mtime = time(NULL);
+    write_log_append(node->ino, 0, new_size, pid, tree_root, 0.0, 0.0);
     inode_save();
     return 0;
 }
 
-int inode_unlink(const char *path) {
+int inode_unlink(const char *path, pid_t pid, pid_t tree_root) {
     VaultInode *node = inode_lookup(path);
     if (!node) return -ENOENT;
     if (S_ISDIR(node->mode)) return -EISDIR;
@@ -389,6 +409,8 @@ int inode_unlink(const char *path) {
         }
     }
 
+    write_log_append(node->ino, 0, 0, pid, tree_root, 0.0, 0.0);
+
     for (uint32_t i = 0; i < g_vaultfs.inode_count; i++) {
         if (g_vaultfs.inodes[i].ino == node->ino) {
             g_vaultfs.inodes[i] = g_vaultfs.inodes[g_vaultfs.inode_count - 1];
@@ -397,6 +419,37 @@ int inode_unlink(const char *path) {
         }
     }
 
+    inode_save();
+    return 0;
+}
+
+int inode_rename(const char *oldpath, const char *newpath, pid_t pid, pid_t tree_root) {
+    VaultInode *node = inode_lookup(oldpath);
+    if (!node) return -ENOENT;
+
+    char new_parent_path[VAULTFS_MAX_PATH];
+    char new_name[VAULTFS_MAX_NAME];
+    split_path(newpath, new_parent_path, new_name);
+
+    VaultInode *new_parent = inode_lookup(new_parent_path);
+    if (!new_parent) return -ENOENT;
+    if (!S_ISDIR(new_parent->mode)) return -ENOTDIR;
+
+    VaultInode *dest_node = inode_lookup(newpath);
+    if (dest_node) {
+        inode_unlink(newpath, pid, tree_root);
+    }
+
+    node->parent_ino = new_parent->ino;
+    strncpy(node->name, new_name, sizeof(node->name) - 1);
+    node->name[sizeof(node->name) - 1] = '\0';
+    node->ctime = time(NULL);
+
+    if (write_log_is_tree_flagged(tree_root)) {
+        node->quarantined_by_tree = tree_root;
+    }
+
+    write_log_append(node->ino, 0, 0, pid, tree_root, 0.0, 0.0);
     inode_save();
     return 0;
 }
@@ -425,12 +478,17 @@ int inode_rmdir(const char *path) {
     return 0;
 }
 
-int inode_heal_quarantine(void) {
+int inode_heal_tree(pid_t tree_root) {
     int healed_count = 0;
 
     for (uint32_t i = 0; i < g_vaultfs.inode_count; i++) {
         VaultInode *node = &g_vaultfs.inodes[i];
         if (node->is_quarantined && node->ghost_chunk_count > 0) {
+            // Scoped rollback: if tree_root is non-zero, restore only files modified by that tree
+            if (tree_root != 0 && node->quarantined_by_tree != tree_root) {
+                continue;
+            }
+
             // 1. Release corrupted/encrypted blocks written by ransomware
             for (uint32_t c = 0; c < node->chunk_count; c++) {
                 storage_release_chunk(node->chunk_hashes[c]);
@@ -445,6 +503,7 @@ int inode_heal_quarantine(void) {
 
             // 3. Clear quarantine flags
             node->is_quarantined = false;
+            node->quarantined_by_tree = 0;
             node->ghost_chunk_count = 0;
             node->ghost_size = 0;
             node->mtime = time(NULL);
@@ -453,11 +512,19 @@ int inode_heal_quarantine(void) {
     }
 
     if (healed_count > 0) {
-        g_vaultfs.files_quarantined = 0;
+        if (g_vaultfs.files_quarantined >= (uint32_t)healed_count) {
+            g_vaultfs.files_quarantined -= (uint32_t)healed_count;
+        } else {
+            g_vaultfs.files_quarantined = 0;
+        }
         inode_save();
         storage_save_catalog();
     }
     return healed_count;
+}
+
+int inode_heal_quarantine(void) {
+    return inode_heal_tree(0);
 }
 
 void inode_save(void) {
