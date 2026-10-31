@@ -86,6 +86,20 @@ typedef struct {
     uint32_t files_quarantined;
 } VaultFSStats;
 
+typedef enum {
+    SCORING_MODE_DEDUP_AWARE = 0,
+    SCORING_MODE_ENTROPY_ONLY = 1
+} ScoringMode;
+
+typedef struct {
+    ScoringMode mode;
+    double      threshold;            // Combined anomaly score threshold (default: 0.50)
+    double      weight_entropy_jump;  // Weight for baseline entropy surge (default: 0.35)
+    double      weight_abs_entropy;   // Weight for absolute high entropy (default: 0.25)
+    double      weight_dedup_novelty; // Weight for dedup novelty 1 - hit_ratio (default: 0.20)
+    double      weight_replacement;   // Weight for in-place replacement fraction (default: 0.20)
+} RansomShieldConfig;
+
 // Global Filesystem State
 typedef struct {
     char          backing_dir[VAULTFS_MAX_PATH];
@@ -106,9 +120,10 @@ typedef struct {
     uint32_t      snapshot_count;
 
     // RansomShield Engine
-    bool          ransomshield_enabled;
-    uint32_t      ransomware_attacks_detected;
-    uint32_t      files_quarantined;
+    bool               ransomshield_enabled;
+    RansomShieldConfig rs_config;
+    uint32_t           ransomware_attacks_detected;
+    uint32_t           files_quarantined;
 } VaultFSContext;
 
 extern VaultFSContext g_vaultfs;

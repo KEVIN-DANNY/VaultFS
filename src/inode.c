@@ -1,4 +1,5 @@
 #include "inode.h"
+#include "crypto.h"
 #include "storage.h"
 #include "entropy.h"
 #include "wal.h"
@@ -146,17 +147,46 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset, pi
     if (!node || S_ISDIR(node->mode)) return -EISDIR;
     if (size == 0) return 0;
 
-    double incoming_entropy = entropy_calculate((const unsigned char *)buf, size);
-    double anomaly_delta = 0.0;
-    if (node->baseline_entropy > 0.0 && entropy_is_ransomware_suspect(node->baseline_entropy, incoming_entropy)) {
-        anomaly_delta = 1.0;
+    // --- Feature 2: Per-Write Dedup Hit Ratio & Replacement Fraction ---
+    size_t write_chunks = (size + VAULTFS_BLOCK_SIZE - 1) / VAULTFS_BLOCK_SIZE;
+    size_t dedup_hits = 0;
+    for (size_t c = 0; c < write_chunks; c++) {
+        size_t c_offset = c * VAULTFS_BLOCK_SIZE;
+        size_t c_len = (size - c_offset > VAULTFS_BLOCK_SIZE) ? VAULTFS_BLOCK_SIZE : (size - c_offset);
+        char c_hash[VAULTFS_HASH_HEX_LEN + 1];
+        crypto_sha256((const unsigned char *)buf + c_offset, c_len, c_hash);
+        if (storage_has_chunk(c_hash)) {
+            dedup_hits++;
+        }
+    }
+    double dedup_hit_ratio = (write_chunks > 0) ? ((double)dedup_hits / (double)write_chunks) : 0.0;
+
+    double replacement_fraction = 0.0;
+    if (node->chunk_count > 0) {
+        size_t start_chunk = offset / VAULTFS_BLOCK_SIZE;
+        size_t end_chunk = (offset + size - 1) / VAULTFS_BLOCK_SIZE;
+        size_t replaced_count = 0;
+        for (size_t c = start_chunk; c <= end_chunk && c < node->chunk_count; c++) {
+            replaced_count++;
+        }
+        replacement_fraction = (double)replaced_count / (double)node->chunk_count;
     }
 
-    bool tree_flagged = write_log_evaluate_tree(tree_root, node->ino, anomaly_delta, ANOMALY_DEFAULT_THRESHOLD);
+    double incoming_entropy = entropy_calculate((const unsigned char *)buf, size);
+    AnomalyScoreDetails details = entropy_evaluate_multifactor(
+        node->baseline_entropy,
+        incoming_entropy,
+        dedup_hit_ratio,
+        replacement_fraction,
+        &g_vaultfs.rs_config
+    );
 
-    // --- RansomShield Anomaly Detection Pipeline (Process-Tree Attributed) ---
+    double anomaly_delta = details.is_suspect ? details.score : 0.0;
+    bool tree_flagged = write_log_evaluate_tree(tree_root, node->ino, anomaly_delta, g_vaultfs.rs_config.threshold);
+
+    // --- RansomShield Anomaly Detection Pipeline (Dedup-Aware & Process-Tree Attributed) ---
     if (g_vaultfs.ransomshield_enabled && node->baseline_entropy > 0.0) {
-        if (anomaly_delta > 0.0 && tree_flagged) {
+        if ((details.is_suspect || tree_flagged) && details.score > 0.0) {
             if (!node->is_quarantined) {
                 node->is_quarantined = true;
                 node->quarantined_by_tree = tree_root;
@@ -171,13 +201,18 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset, pi
 
                 g_vaultfs.ransomware_attacks_detected++;
                 g_vaultfs.files_quarantined++;
-                write_log_record_quarantined_file(tree_root, node->ino, node->name, incoming_entropy);
+                write_log_record_quarantined_file(tree_root, node->ino, node->name, details.score);
 
                 fprintf(stderr, "\n[!] ==================================================================\n");
                 fprintf(stderr, "[!] [RANSOMSHIELD ALERT] Ransomware attack intercepted on file '%s'!\n", node->name);
                 fprintf(stderr, "[!] Compromised Process Tree Root PID: %d (Caller PID: %d)\n", (int)tree_root, (int)pid);
                 fprintf(stderr, "[!] Baseline Entropy: %.2f | Incoming Entropy: %.2f (Elevated)\n",
                         node->baseline_entropy, incoming_entropy);
+                fprintf(stderr, "[!] Dedup Hit Ratio : %.2f | Replacement Fraction: %.2f\n",
+                        dedup_hit_ratio, replacement_fraction);
+                fprintf(stderr, "[!] Multi-Factor Score: %.2f (Threshold: %.2f | Mode: %s)\n",
+                        details.score, g_vaultfs.rs_config.threshold,
+                        g_vaultfs.rs_config.mode == SCORING_MODE_DEDUP_AWARE ? "Dedup-Aware" : "Entropy-Only");
                 fprintf(stderr, "[!] Original %u block(s) frozen in Cryptographic Quarantine Tomb.\n", node->ghost_chunk_count);
                 fprintf(stderr, "[!] Scoped rollback available via: vaultfs-ctl heal --tree %d <storage_dir>\n", (int)tree_root);
                 fprintf(stderr, "[!] ==================================================================\n\n");
@@ -297,8 +332,8 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset, pi
         }
     }
 
-    // Log write to bounded ring buffer with process-tree attribution
-    write_log_append(node->ino, offset, size, pid, tree_root, incoming_entropy, 0.0);
+    // Log write to bounded ring buffer with process-tree attribution and dedup metrics
+    write_log_append(node->ino, offset, size, pid, tree_root, incoming_entropy, dedup_hit_ratio);
 
     inode_save();
     return (int)bytes_written;

@@ -24,6 +24,14 @@ static int find_catalog_entry(const char *hash) {
     return -1;
 }
 
+bool storage_has_chunk(const char *hash) {
+    if (!hash) return false;
+    pthread_mutex_lock(&s_storage_lock);
+    int idx = find_catalog_entry(hash);
+    pthread_mutex_unlock(&s_storage_lock);
+    return (idx >= 0);
+}
+
 static void get_block_path(const char *hash, char *path_out, size_t max_len) {
     snprintf(path_out, max_len, "%s/blocks/%s", g_vaultfs.backing_dir, hash);
 }

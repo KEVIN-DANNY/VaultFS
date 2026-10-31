@@ -241,6 +241,37 @@ static int vaultfs_utimens(const char *path, const struct timespec tv[2],
     return 0;
 }
 
+static int vaultfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    (void)fi;
+    pthread_mutex_lock(&g_vaultfs.lock);
+    VaultInode *node = inode_lookup(path);
+    if (!node) {
+        pthread_mutex_unlock(&g_vaultfs.lock);
+        return -ENOENT;
+    }
+    node->mode = (node->mode & S_IFMT) | (mode & 07777);
+    node->ctime = time(NULL);
+    inode_save();
+    pthread_mutex_unlock(&g_vaultfs.lock);
+    return 0;
+}
+
+static int vaultfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
+    (void)fi;
+    pthread_mutex_lock(&g_vaultfs.lock);
+    VaultInode *node = inode_lookup(path);
+    if (!node) {
+        pthread_mutex_unlock(&g_vaultfs.lock);
+        return -ENOENT;
+    }
+    if (uid != (uid_t)-1) node->uid = uid;
+    if (gid != (gid_t)-1) node->gid = gid;
+    node->ctime = time(NULL);
+    inode_save();
+    pthread_mutex_unlock(&g_vaultfs.lock);
+    return 0;
+}
+
 static struct fuse_operations s_vaultfs_ops = {
     .getattr  = vaultfs_getattr,
     .readdir  = vaultfs_readdir,
@@ -251,6 +282,8 @@ static struct fuse_operations s_vaultfs_ops = {
     .truncate = vaultfs_truncate,
     .unlink   = vaultfs_unlink,
     .rename   = vaultfs_rename,
+    .chmod    = vaultfs_chmod,
+    .chown    = vaultfs_chown,
     .mkdir    = vaultfs_mkdir,
     .rmdir    = vaultfs_rmdir,
     .statfs   = vaultfs_statfs,

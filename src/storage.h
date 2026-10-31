@@ -4,6 +4,7 @@
 #include "vaultfs.h"
 
 int  storage_init(const char *backing_dir);
+bool storage_has_chunk(const char *hash);
 int  storage_write_chunk(const unsigned char *data, size_t len, char *hash_out);
 int  storage_read_chunk(const char *hash, unsigned char *data_out, size_t *len_out);
 int  storage_retain_chunk(const char *hash);

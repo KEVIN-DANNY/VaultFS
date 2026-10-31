@@ -7,6 +7,7 @@
 #include "wal.h"
 #include "proc_tree.h"
 #include "write_log.h"
+#include "entropy.h"
 
 VaultFSContext g_vaultfs;
 
@@ -15,6 +16,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s <storage_dir> <mount_point> [OPTIONS] [FUSE_OPTIONS]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p, --password <secret>   Master password for AES-256 encryption\n");
+    fprintf(stderr, "  -m, --mode <mode>         Scoring mode: 'dedup_aware' (default) or 'entropy_only'\n");
+    fprintf(stderr, "  -t, --threshold <float>   Anomaly score threshold (default: 0.50)\n");
+    fprintf(stderr, "  --weights <a,b,c,d>       Weights: jump,abs_ent,dedup_novelty,replacement\n");
+    fprintf(stderr, "  -c, --config <file>       Path to RansomShield configuration file\n");
     fprintf(stderr, "  -d, --debug               Run FUSE in foreground with debug logs\n");
     fprintf(stderr, "  -h, --help                Show this help message\n\n");
     fprintf(stderr, "Example:\n");
@@ -29,10 +34,17 @@ int main(int argc, char **argv) {
 
     memset(&g_vaultfs, 0, sizeof(VaultFSContext));
     pthread_mutex_init(&g_vaultfs.lock, NULL);
+    g_vaultfs.ransomshield_enabled = true;
+    config_init_defaults(&g_vaultfs.rs_config);
 
     // Extract storage_dir and mount_point
     strncpy(g_vaultfs.backing_dir, argv[1], sizeof(g_vaultfs.backing_dir) - 1);
     strncpy(g_vaultfs.mount_point, argv[2], sizeof(g_vaultfs.mount_point) - 1);
+
+    // Check for config file in backing directory first
+    char def_conf[VAULTFS_MAX_PATH + 64];
+    snprintf(def_conf, sizeof(def_conf), "%s/vaultfs.conf", g_vaultfs.backing_dir);
+    config_load_file(def_conf, &g_vaultfs.rs_config);
 
     // Filter arguments for FUSE and VaultFS custom flags
     char *fuse_argv[64];
@@ -44,6 +56,31 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
             if (i + 1 < argc) {
                 strncpy(g_vaultfs.password, argv[++i], sizeof(g_vaultfs.password) - 1);
+            }
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mode") == 0) {
+            if (i + 1 < argc) {
+                const char *m = argv[++i];
+                if (strcmp(m, "entropy_only") == 0) {
+                    g_vaultfs.rs_config.mode = SCORING_MODE_ENTROPY_ONLY;
+                } else {
+                    g_vaultfs.rs_config.mode = SCORING_MODE_DEDUP_AWARE;
+                }
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threshold") == 0) {
+            if (i + 1 < argc) {
+                g_vaultfs.rs_config.threshold = atof(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "--weights") == 0) {
+            if (i + 1 < argc) {
+                sscanf(argv[++i], "%lf,%lf,%lf,%lf",
+                       &g_vaultfs.rs_config.weight_entropy_jump,
+                       &g_vaultfs.rs_config.weight_abs_entropy,
+                       &g_vaultfs.rs_config.weight_dedup_novelty,
+                       &g_vaultfs.rs_config.weight_replacement);
+            }
+        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            if (i + 1 < argc) {
+                config_load_file(argv[++i], &g_vaultfs.rs_config);
             }
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             g_vaultfs.debug = true;
@@ -63,6 +100,28 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Check environment variables overrides
+    const char *env_mode = getenv("VAULTFS_SCORING_MODE");
+    if (env_mode) {
+        if (strcmp(env_mode, "entropy_only") == 0) {
+            g_vaultfs.rs_config.mode = SCORING_MODE_ENTROPY_ONLY;
+        } else {
+            g_vaultfs.rs_config.mode = SCORING_MODE_DEDUP_AWARE;
+        }
+    }
+    const char *env_thresh = getenv("VAULTFS_THRESHOLD");
+    if (env_thresh) {
+        g_vaultfs.rs_config.threshold = atof(env_thresh);
+    }
+    const char *env_weights = getenv("VAULTFS_WEIGHTS");
+    if (env_weights) {
+        sscanf(env_weights, "%lf,%lf,%lf,%lf",
+               &g_vaultfs.rs_config.weight_entropy_jump,
+               &g_vaultfs.rs_config.weight_abs_entropy,
+               &g_vaultfs.rs_config.weight_dedup_novelty,
+               &g_vaultfs.rs_config.weight_replacement);
+    }
+
     printf("===================================================================\n");
     printf("   VaultFS: Encrypted, Content-Deduplicated & Snapshotting FS     \n");
     printf("===================================================================\n");
@@ -71,7 +130,14 @@ int main(int argc, char **argv) {
     printf("[*] AES-256 Encryption Mode   : Convergent AES-256-CBC Enabled\n");
     printf("[*] Content Deduplication     : SHA-256 Block-Level Hash Engine\n");
     printf("[*] Time-Travel Snapshots     : Copy-On-Write (Zero-Copy) Engine\n");
-    printf("[*] RansomShield Active Guard : Real-Time Entropy Interception Enabled\n");
+    printf("[*] RansomShield Mode         : %s\n",
+           g_vaultfs.rs_config.mode == SCORING_MODE_DEDUP_AWARE ? "Dedup-Aware Multi-Factor Active Defense" : "Entropy-Only Legacy Guard");
+    printf("[*] Anomaly Threshold         : %.2f (Weights: jump=%.2f, abs=%.2f, dedup=%.2f, repl=%.2f)\n",
+           g_vaultfs.rs_config.threshold,
+           g_vaultfs.rs_config.weight_entropy_jump,
+           g_vaultfs.rs_config.weight_abs_entropy,
+           g_vaultfs.rs_config.weight_dedup_novelty,
+           g_vaultfs.rs_config.weight_replacement);
     printf("===================================================================\n");
 
     // Initialize subsystems
