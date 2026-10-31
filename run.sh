@@ -26,6 +26,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
         exec docker run --privileged --device /dev/fuse --cap-add SYS_ADMIN --rm -it -v "$DIR:/workspace/VaultFS" -w /workspace/VaultFS vaultfs bash test_demos.sh
     elif [ "$1" = "ransomware" ] || [ "$1" = "heal" ]; then
         exec docker run --privileged --device /dev/fuse --cap-add SYS_ADMIN --rm -it -v "$DIR:/workspace/VaultFS" -w /workspace/VaultFS vaultfs bash test_ransomware.sh
+    elif [ "$1" = "research" ] || [ "$1" = "eval" ] || [ "$1" = "bench" ]; then
+        exec docker run --privileged --device /dev/fuse --cap-add SYS_ADMIN --rm -it -v "$DIR:/workspace/VaultFS" -w /workspace/VaultFS vaultfs bash test_research.sh
     elif [ "$1" = "shell" ] || [ "$1" = "bash" ]; then
         exec docker run --privileged --device /dev/fuse --cap-add SYS_ADMIN --rm -it -v "$DIR:/workspace/VaultFS" -w /workspace/VaultFS vaultfs bash
     else
@@ -40,6 +42,8 @@ else
         exec bash test_demos.sh
     elif [ "$1" = "ransomware" ] || [ "$1" = "heal" ]; then
         exec bash test_ransomware.sh
+    elif [ "$1" = "research" ] || [ "$1" = "eval" ] || [ "$1" = "bench" ]; then
+        exec bash test_research.sh
     else
         exec "$@"
     fi
