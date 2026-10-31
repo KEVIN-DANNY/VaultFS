@@ -101,7 +101,16 @@ pid_t proc_tree_get_root(pid_t pid) {
 
         char state = ' ';
         int ppid = 0;
-        if (sscanf(rparen + 1, " %c %d", &state, &ppid) != 2) {
+        int pgrp = 0;
+        int session = 0;
+        if (sscanf(rparen + 1, " %c %d %d %d", &state, &ppid, &pgrp, &session) < 2) {
+            break;
+        }
+
+        // If curr is a process group leader (e.g. background job, setsid, daemon)
+        // and distinct from init/VaultFS, curr is the definitive process tree root
+        if (pgrp > 1 && curr == (pid_t)pgrp && pgrp != (int)getpid()) {
+            root = curr;
             break;
         }
 

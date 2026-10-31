@@ -1,0 +1,7 @@
+VaultFS Research Evaluation Environment:
+- Date/Time: Sat Oct 31 11:52:53 UTC 2026
+- OS / Kernel: Linux 17440450799f 6.12.54-linuxkit #1 SMP Tue Nov  4 21:21:47 UTC 2025 aarch64 aarch64 aarch64 GNU/Linux
+- FUSE Library: fusermount3 version: 3.10.5
+- OpenSSL Version: OpenSSL 3.0.2 15 Mar 2022 (Library: OpenSSL 3.0.2 15 Mar 2022)
+- GCC Version: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+- Git Commit: 1f1a347c258e05d930cebd5e35e697f552a1c60b

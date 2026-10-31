@@ -1,0 +1,5 @@
+Filesystem_Engine,Operation,Median_Throughput_MBs,Median_P50_us,Median_P95_us,Latency_P50_Overhead_Pct
+FUSE_Passthrough,Sequential_Write,117.03,29.63,53.96,0.0%
+VaultFS,Sequential_Write,0.24,6092.21,18466.17,+20461.0%
+FUSE_Passthrough,Sequential_Read,3758.22,0.29,0.50,0.0%
+VaultFS,Sequential_Read,1575.77,0.29,0.50,+0.0%

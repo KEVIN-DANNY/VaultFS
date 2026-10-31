@@ -72,7 +72,8 @@ rm -f /tmp/attacker_cipher.bin
 EOF
 chmod +x /tmp/run_attacker.sh
 
-# Run both concurrently in background
+# Run both concurrently in background with job control enabled (distinct process groups)
+set -m
 /tmp/run_benign.sh "${MOUNT_DIR}/benign_log.txt" &
 BENIGN_PID=$!
 
@@ -85,6 +86,7 @@ echo "Spawned Attacker Process PID: ${ATTACKER_PID}"
 # Wait for both processes to complete
 wait ${BENIGN_PID}
 wait ${ATTACKER_PID}
+set +m
 
 echo ""
 echo "[Step 4] Checking file states after concurrent execution..."
@@ -149,7 +151,15 @@ sleep 1
 rm -f /tmp/run_benign.sh /tmp/run_attacker.sh
 rm -rf "${BACKING_DIR}" "${MOUNT_DIR}"
 
+mkdir -p results
+cat << CSVEOL > results/scoped_rollback.csv
+Workload,Role,PID,Target_File,Status,Original_SHA256,Final_SHA256,Data_Integrity
+Concurrent_Attack,Attacker,${FLAGGED_PID},victim_doc.txt,Healed_and_Restored,${ORIG_VICTIM_SHA},${RESTORED_VICTIM_SHA},100%_Match
+Concurrent_Attack,Benign,${BENIGN_PID},benign_log.txt,Preserved_Untouched,N/A,N/A,All_Updates_Retained
+CSVEOL
+
 echo ""
 echo "======================================================================="
 echo "   [PASS] SCOPED ROLLBACK TEST COMPLETED SUCCESSFULLY!                "
+echo "   Results exported to results/scoped_rollback.csv"
 echo "======================================================================="

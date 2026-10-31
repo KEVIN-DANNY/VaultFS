@@ -170,6 +170,9 @@ int inode_write(VaultInode *node, const char *buf, size_t size, off_t offset, pi
             replaced_count++;
         }
         replacement_fraction = (double)replaced_count / (double)node->chunk_count;
+    } else if (node->ghost_chunk_count > 0) {
+        // Truncate-first (O_TRUNC) attack case: file blocks were preserved in ghost tomb before truncation
+        replacement_fraction = 1.0;
     }
 
     double incoming_entropy = entropy_calculate((const unsigned char *)buf, size);

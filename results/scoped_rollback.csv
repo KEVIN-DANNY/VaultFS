@@ -1,0 +1,3 @@
+Workload,Role,PID,Target_File,Status,Original_SHA256,Final_SHA256,Data_Integrity
+Concurrent_Attack,Attacker,132,victim_doc.txt,Healed_and_Restored,e0ae9d124c2704ec3833f599900b8b9346553f88792fcc914cc747665946e4b1,e0ae9d124c2704ec3833f599900b8b9346553f88792fcc914cc747665946e4b1,100%_Match
+Concurrent_Attack,Benign,131,benign_log.txt,Preserved_Untouched,N/A,N/A,All_Updates_Retained

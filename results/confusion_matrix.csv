@@ -1,0 +1,9 @@
+Metric,Legacy_Entropy_Only,Dedup_Aware_Engine
+True_Positives_TP,1,1
+False_Positives_FP,3,0
+True_Negatives_TN,3,6
+False_Negatives_FN,0,0
+Accuracy,57.1%,100.0%
+Precision,25.0%,100.0%
+Specificity,50.0%,100.0%
+Recall,100.0%,100.0%

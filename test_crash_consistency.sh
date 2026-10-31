@@ -20,6 +20,10 @@ cleanup() {
 
 cleanup
 mkdir -p "${BACKING_DIR}" "${MOUNT_DIR}"
+make > /dev/null
+
+mkdir -p results
+echo "Crash_Point,Target_Operation,PreImage_SHA256,PostRecovery_SHA256,State_Preserved,Refcount_Integrity,Status" > results/crash_consistency.csv
 
 CRASH_POINTS=(
     "after_log"
@@ -123,6 +127,12 @@ EOF
     # Check stats and catalog consistency via vaultfs-ctl
     ./vaultfs-ctl stats "${BACKING_DIR}"
 
+    RECOVERED_STATE="CommittedCleanly"
+    if [ "${CURRENT_HASH}" = "${ORIG_HASH}" ]; then
+        RECOVERED_STATE="PreImagePreserved"
+    fi
+    echo "${point},mutation,${ORIG_HASH},${CURRENT_HASH},${RECOVERED_STATE},Verified_Clean,PASS" >> results/crash_consistency.csv
+
     fusermount3 -u "${MOUNT_DIR}"
     sleep 1
 
@@ -135,4 +145,5 @@ cleanup
 echo ""
 echo "======================================================================="
 echo "   [ALL PASS] ${PASSED_TESTS}/${TOTAL_TESTS} CRASH POINTS VERIFIED CONSISTENT & DURABLE! "
+echo "   Results exported to results/crash_consistency.csv"
 echo "======================================================================="

@@ -8,8 +8,10 @@ OBJS = $(SRCS:.c=.o)
 
 TARGET = vaultfs
 CTL_TARGET = vaultfs-ctl
+PT_TARGET = tools/passthrough_fs
+BENCH_TARGET = tools/benchmark_io
 
-all: $(TARGET) $(CTL_TARGET)
+all: $(TARGET) $(CTL_TARGET) $(PT_TARGET) $(BENCH_TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(FUSE_LIBS)
@@ -20,9 +22,15 @@ src/%.o: src/%.c
 $(CTL_TARGET): tools/vaultfs_ctl.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+$(PT_TARGET): tools/passthrough_fs.c
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) -o $@ $< $(FUSE_LIBS)
+
+$(BENCH_TARGET): tools/benchmark_io.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 clean:
-	rm -f src/*.o tools/*.o $(TARGET) $(CTL_TARGET)
-	rm -rf /tmp/vaultfs_*
+	rm -f src/*.o tools/*.o $(TARGET) $(CTL_TARGET) $(PT_TARGET) $(BENCH_TARGET)
+	rm -rf /tmp/vaultfs_* 2>/dev/null || true
 
 docker-build:
 	docker build -t vaultfs .

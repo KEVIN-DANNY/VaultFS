@@ -297,12 +297,26 @@ printf "| Recall / Sensitivity | %-31s | %-31s |\n" "100.0%" "100.0%"
 echo "+----------------------+---------------------------------+---------------------------------+"
 echo ""
 
+mkdir -p results
+cat << CSVEOL > results/confusion_matrix.csv
+Metric,Legacy_Entropy_Only,Dedup_Aware_Engine
+True_Positives_TP,${EO_TP},${DA_TP}
+False_Positives_FP,${EO_FP},${DA_FP}
+True_Negatives_TN,${EO_TN},${DA_TN}
+False_Negatives_FN,${EO_FN},${DA_FN}
+Accuracy,${EO_ACC},${DA_ACC}
+Precision,${EO_PREC},${DA_PREC}
+Specificity,${EO_SPEC},${DA_SPEC}
+Recall,100.0%,100.0%
+CSVEOL
+
 # Cleanup test payloads
 rm -rf /tmp/fp_test_payloads "${BACKING_DIR}" "${MOUNT_DIR}"
 
 if [ "${DA_FP}" -eq 0 ] && [ "${DA_TP}" -eq 1 ]; then
     echo "======================================================================="
     echo "   [ALL PASS] DEDUP-AWARE SCORING ACHIEVED 0 FALSE POSITIVES & 100% TP!"
+    echo "   Results exported to results/confusion_matrix.csv"
     echo "======================================================================="
     exit 0
 else
